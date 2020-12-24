@@ -69,6 +69,7 @@ use tikv_util::{
     time::Monitor,
     worker::{FutureWorker, Worker},
 };
+use txn_types::RangeTTLRegistry;
 
 /// Run a TiKV server. Returns when the server is shutdown by the user, in which
 /// case the server will be properly stopped.
@@ -127,6 +128,7 @@ struct TiKVServer {
     coprocessor_host: Option<CoprocessorHost>,
     to_stop: Vec<Box<dyn Stop>>,
     lock_files: Vec<File>,
+    ranges_ttl_registry: RangeTTLRegistry,
 }
 
 struct Engines {
@@ -186,6 +188,7 @@ impl TiKVServer {
             coprocessor_host,
             to_stop: vec![Box::new(resolve_worker)],
             lock_files: vec![],
+            ranges_ttl_registry: RangeTTLRegistry::new(),
         }
     }
 
@@ -366,6 +369,7 @@ impl TiKVServer {
             engines.kv.c().clone(),
             store_meta.clone(),
             self.router.clone(),
+            Clone::clone(&self.ranges_ttl_registry),
         );
         let raft_router = ServerRaftStoreRouter::new(self.router.clone(), local_reader);
 
@@ -587,6 +591,7 @@ impl TiKVServer {
             importer.clone(),
             split_check_worker,
             auto_split_controller,
+            Clone::clone(&self.ranges_ttl_registry),
         )
         .unwrap_or_else(|e| fatal!("failed to start node: {}", e));
 
@@ -598,7 +603,7 @@ impl TiKVServer {
             self.region_info_accessor.clone(),
             node.id(),
         );
-        if let Err(e) = gc_worker.start_auto_gc(auto_gc_config) {
+        if let Err(e) = gc_worker.start_auto_gc(auto_gc_config, Clone::clone(&self.ranges_ttl_registry)) {
             fatal!("failed to start auto_gc on storage, error: {}", e);
         }
 
@@ -802,6 +807,7 @@ impl TiKVServer {
             if let Err(e) = status_server.start(
                 self.config.server.status_addr.clone(),
                 self.config.server.advertise_status_addr.clone(),
+                Clone::clone(&self.ranges_ttl_registry),
             ) {
                 error!(%e; "failed to bind addr for status service");
             } else {
@@ -865,11 +871,13 @@ fn check_system_config(config: &TiKvConfig) {
         // open files here
         rocksdb_max_open_files *= 2;
     }
+    /*
     if let Err(e) = tikv_util::config::check_max_open_fds(
         RESERVED_OPEN_FDS + (rocksdb_max_open_files + config.raftdb.max_open_files) as u64,
     ) {
         fatal!("{}", e);
     }
+    */
 
     // Check RocksDB data dir
     if let Err(e) = tikv_util::config::check_data_dir(&config.storage.data_dir) {

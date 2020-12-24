@@ -32,7 +32,7 @@ use raft::{
     NO_LIMIT,
 };
 use time::Timespec;
-use txn_types::TxnExtra;
+use txn_types::{TxnExtra, RangeTTLRegistry};
 use uuid::Uuid;
 
 use crate::coprocessor::{CoprocessorHost, RegionChangeEvent};
@@ -2534,6 +2534,7 @@ impl Peer {
             ctx.engines.kv.c().clone(),
             check_epoch,
             false, /* we don't need snapshot time */
+            Clone::clone(&ctx.ranges_ttl_registry),
         )
         .execute(&req, self.region(), read_index);
         resp.txn_extra_op = self.txn_extra_op.load();
@@ -2917,19 +2918,21 @@ pub struct ReadExecutor<E: KvEngine> {
     snapshot: Option<<E::Snapshot as Snapshot<E>>::SyncSnapshot>,
     snapshot_time: Option<Timespec>,
     need_snapshot_time: bool,
+    ranges_ttl_registry: RangeTTLRegistry,
 }
 
 impl<E> ReadExecutor<E>
 where
     E: KvEngine,
 {
-    pub fn new(engine: E, check_epoch: bool, need_snapshot_time: bool) -> Self {
+    pub fn new(engine: E, check_epoch: bool, need_snapshot_time: bool,ranges_ttl_registry: RangeTTLRegistry) -> Self {
         ReadExecutor {
             check_epoch,
             engine,
             snapshot: None,
             snapshot_time: None,
             need_snapshot_time,
+            ranges_ttl_registry,
         }
     }
 

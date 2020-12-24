@@ -17,7 +17,7 @@ use kvproto::pdpb::{self, Member};
 use security::SecurityManager;
 use tikv_util::time::duration_to_sec;
 use tikv_util::{Either, HandyRwLock};
-use txn_types::TimeStamp;
+use txn_types::{RangeTTL, TimeStamp};
 
 use super::metrics::*;
 use super::util::{check_resp_header, sync_request, validate_endpoints, Inner, LeaderClient};
@@ -594,7 +594,7 @@ impl PdClient for RpcClient {
         self.leader_client.on_reconnect(Box::new(f))
     }
 
-    fn get_gc_safe_point(&self) -> PdFuture<u64> {
+    fn get_gc_safe_point(&self) -> PdFuture<(u64, Vec<RangeTTL>)> {
         let timer = Instant::now();
 
         let mut req = pdpb::GetGcSafePointRequest::default();
@@ -609,12 +609,19 @@ impl PdClient for RpcClient {
                 .unwrap_or_else(|e| {
                     panic!("fail to request PD {} err {:?}", "get_gc_saft_point", e)
                 });
-            Box::new(handler.map_err(Error::Grpc).and_then(move |resp| {
+            Box::new(handler.map_err(Error::Grpc).and_then(move |mut resp| {
                 PD_REQUEST_HISTOGRAM_VEC
                     .with_label_values(&["get_gc_safe_point"])
                     .observe(duration_to_sec(timer.elapsed()));
                 check_resp_header(resp.get_header())?;
-                Ok(resp.get_safe_point())
+                Ok((
+                    resp.get_safe_point(),
+                    resp.take_range_ttl()
+                        .into_vec()
+                        .into_iter()
+                        .map(From::from)
+                        .collect(),
+                ))
             })) as PdFuture<_>
         };
 

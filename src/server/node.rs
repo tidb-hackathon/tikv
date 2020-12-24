@@ -28,6 +28,7 @@ use raftstore::store::{self, initial_region, Config as StoreConfig, SnapManager,
 use tikv_util::config::VersionTrack;
 use tikv_util::worker::FutureWorker;
 use tikv_util::worker::Worker;
+use txn_types::RangeTTLRegistry;
 
 const MAX_CHECK_CLUSTER_BOOTSTRAPPED_RETRY_COUNT: u64 = 60;
 const CHECK_CLUSTER_BOOTSTRAPPED_RETRY_SECONDS: u64 = 3;
@@ -132,6 +133,7 @@ where
         importer: Arc<SSTImporter>,
         split_check_worker: Worker<SplitCheckTask>,
         auto_split_controller: AutoSplitController,
+        ranges_ttl_registry: RangeTTLRegistry,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -168,6 +170,7 @@ where
             importer,
             split_check_worker,
             auto_split_controller,
+            ranges_ttl_registry,
         )?;
 
         // Put store only if the cluster is bootstrapped.
@@ -346,6 +349,7 @@ where
         importer: Arc<SSTImporter>,
         split_check_worker: Worker<SplitCheckTask>,
         auto_split_controller: AutoSplitController,
+        ranges_ttl_registry: RangeTTLRegistry,
     ) -> Result<()>
     where
         T: Transport + 'static,
@@ -372,6 +376,7 @@ where
             importer,
             split_check_worker,
             auto_split_controller,
+            ranges_ttl_registry,
         )?;
         Ok(())
     }

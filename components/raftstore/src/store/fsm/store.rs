@@ -77,6 +77,7 @@ use tikv_util::time::{duration_to_sec, Instant as TiInstant};
 use tikv_util::timer::SteadyTimer;
 use tikv_util::worker::{FutureScheduler, FutureWorker, Scheduler, Worker};
 use tikv_util::{is_zero_duration, sys as sys_util, Either, RingQueue};
+use txn_types::RangeTTLRegistry;
 
 type Key = Vec<u8>;
 
@@ -258,6 +259,7 @@ pub struct PollContext<T, C: 'static> {
     pub perf_context_statistics: PerfContextStatistics,
     pub tick_batch: Vec<PeerTickBatch>,
     pub node_start_time: Option<TiInstant>,
+    pub ranges_ttl_registry: RangeTTLRegistry,
 }
 
 impl<T, C> HandleRaftReadyContext for PollContext<T, C> {
@@ -832,6 +834,7 @@ pub struct RaftPollerBuilder<T, C> {
     global_stat: GlobalStoreStat,
     pub engines: Engines,
     applying_snap_count: Arc<AtomicUsize>,
+    ranges_ttl_registry: RangeTTLRegistry,
 }
 
 impl<T, C> RaftPollerBuilder<T, C> {
@@ -1044,6 +1047,7 @@ where
             perf_context_statistics: PerfContextStatistics::new(self.cfg.value().perf_level),
             tick_batch: vec![PeerTickBatch::default(); 256],
             node_start_time: Some(TiInstant::now_coarse()),
+            ranges_ttl_registry: Clone::clone(&self.ranges_ttl_registry),
         };
         ctx.update_ticks_timeout();
         let tag = format!("[store {}]", ctx.store.get_id());
@@ -1104,6 +1108,7 @@ impl RaftBatchSystem {
         importer: Arc<SSTImporter>,
         split_check_worker: Worker<SplitCheckTask>,
         auto_split_controller: AutoSplitController,
+        ranges_ttl_registry: RangeTTLRegistry,
     ) -> Result<()> {
         assert!(self.workers.is_none());
         // TODO: we can get cluster meta regularly too later.
@@ -1142,6 +1147,7 @@ impl RaftBatchSystem {
             global_stat: GlobalStoreStat::default(),
             store_meta,
             applying_snap_count: Arc::new(AtomicUsize::new(0)),
+            ranges_ttl_registry,
         };
         let region_peers = builder.init()?;
         let engine = RocksEngine::from_db(builder.engines.kv.clone());

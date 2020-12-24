@@ -46,6 +46,7 @@ use tikv_alloc::error::ProfError;
 use tikv_util::collections::HashMap;
 use tikv_util::metrics::dump;
 use tikv_util::timer::GLOBAL_TIMER_HANDLE;
+use txn_types::RangeTTLRegistry;
 
 pub mod region_meta;
 
@@ -402,6 +403,15 @@ where
         }
     }
 
+    async fn get_ttl(
+        ttl: RangeTTLRegistry,
+    ) -> hyper::Result<Response<Body>> {
+        Ok(Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(ttl.json_string()))
+                .unwrap())
+    }
+
     pub fn stop(mut self) {
         // unregister the status address to pd
         self.unregister_addr();
@@ -649,7 +659,7 @@ where
         }
     }
 
-    fn start_serve<I, C>(&mut self, builder: HyperBuilder<I>)
+    fn start_serve<I, C>(&mut self, builder: HyperBuilder<I>, ranges_ttl_registry: RangeTTLRegistry)
     where
         I: Accept<Conn = C, Error = std::io::Error> + Send + 'static,
         I::Error: Into<Box<dyn StdError + Send + Sync>>,
@@ -659,12 +669,14 @@ where
         let security_config = self.security_config.clone();
         let cfg_controller = self.cfg_controller.clone();
         let router = self.router.clone();
+        let expiry = ranges_ttl_registry.clone();
         // Start to serve.
         let server = builder.serve(make_service_fn(move |conn: &C| {
             let x509 = conn.get_x509();
             let security_config = security_config.clone();
             let cfg_controller = cfg_controller.clone();
             let router = router.clone();
+            let expiry = expiry.clone();
             async move {
                 // Create a status service.
                 Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
@@ -672,6 +684,7 @@ where
                     let security_config = security_config.clone();
                     let cfg_controller = cfg_controller.clone();
                     let router = router.clone();
+                    let expiry = expiry.clone();
                     async move {
                         let path = req.uri().path().to_owned();
                         let method = req.method().to_owned();
@@ -688,6 +701,7 @@ where
                             (&Method::GET, "/status") => false,
                             (&Method::GET, "/config") => false,
                             (&Method::GET, "/debug/pprof/profile") => false,
+                            (&Method::GET, "/expiry") => false,
                             // 1. POST "/config" will modify the configuration of TiKV.
                             // 2. GET "/region" will get start key and end key. These keys could be actual
                             // user data since in some cases the data itself is stored in the key.
@@ -721,6 +735,9 @@ where
                             (Method::GET, path) if path.starts_with("/region") => {
                                 Self::dump_region_meta(req, router).await
                             }
+                            (Method::GET, "/ttl") => {
+                                Self::get_ttl(expiry).await
+                            }
                             _ => Ok(StatusServer::err_response(
                                 StatusCode::NOT_FOUND,
                                 "path not found",
@@ -740,7 +757,7 @@ where
         self.thread_pool.spawn(graceful);
     }
 
-    pub fn start(&mut self, status_addr: String, advertise_status_addr: String) -> Result<()> {
+    pub fn start(&mut self, status_addr: String, advertise_status_addr: String, ranges_ttl_registry: RangeTTLRegistry) -> Result<()> {
         let addr = SocketAddr::from_str(&status_addr)?;
 
         let incoming = self.thread_pool.enter(|| AddrIncoming::bind(&addr))?;
@@ -759,10 +776,10 @@ where
             let acceptor = acceptor.build();
             let tls_incoming = tls_incoming(acceptor, incoming);
             let server = Server::builder(tls_incoming);
-            self.start_serve(server);
+            self.start_serve(server, ranges_ttl_registry);
         } else {
             let server = Server::builder(incoming);
-            self.start_serve(server);
+            self.start_serve(server, ranges_ttl_registry);
         }
         // register the advertise status address to pd
         self.register_addr(advertise_status_addr);

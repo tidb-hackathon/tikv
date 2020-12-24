@@ -28,6 +28,7 @@ use tikv_util::time::Instant;
 
 use super::metrics::*;
 use crate::store::fsm::store::StoreMeta;
+use txn_types::RangeTTLRegistry;
 
 /// A read only delegate of `Peer`.
 #[derive(Clone, Debug)]
@@ -173,10 +174,11 @@ where
     // A channel to raftstore.
     router: C,
     tag: String,
+    ranges_ttl_registry: RangeTTLRegistry,
 }
 
 impl<E: KvEngine> LocalReader<RaftRouter<E>, E> {
-    pub fn new(kv_engine: E, store_meta: Arc<Mutex<StoreMeta>>, router: RaftRouter<E>) -> Self {
+    pub fn new(kv_engine: E, store_meta: Arc<Mutex<StoreMeta>>, router: RaftRouter<E>, ranges_ttl_registry: RangeTTLRegistry) -> Self {
         LocalReader {
             store_meta,
             kv_engine,
@@ -185,6 +187,7 @@ impl<E: KvEngine> LocalReader<RaftRouter<E>, E> {
             metrics: Default::default(),
             delegates: RefCell::new(HashMap::default()),
             tag: "[local_reader]".to_string(),
+            ranges_ttl_registry,
         }
     }
 }
@@ -306,6 +309,7 @@ where
             self.kv_engine.clone(),
             false, /* dont check region epoch */
             true,  /* we need snapshot time */
+            Clone::clone(&self.ranges_ttl_registry),
         );
 
         loop {
@@ -408,6 +412,7 @@ where
             metrics: Default::default(),
             delegates: RefCell::new(HashMap::default()),
             tag: self.tag.clone(),
+            ranges_ttl_registry: Clone::clone(&self.ranges_ttl_registry),
         }
     }
 }

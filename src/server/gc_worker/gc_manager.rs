@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread::{self, Builder as ThreadBuilder, JoinHandle};
 use std::time::{Duration, Instant};
 use tikv_util::worker::FutureScheduler;
-use txn_types::{Key, TimeStamp};
+use txn_types::{Key, RangeExpiry, RangeTTL, RangeTTLRegistry, TimeStamp};
 
 use crate::server::metrics::*;
 use raftstore::coprocessor::RegionInfoProvider;
@@ -232,6 +232,7 @@ pub(super) struct GcManager<S: GcSafePointProvider, R: RegionInfoProvider> {
     /// The current safe point. `GcManager` will try to update it periodically. When `safe_point` is
     /// updated, `GCManager` will start to do GC on all regions.
     safe_point: TimeStamp,
+    ttl: Option<Vec<RangeTTL>>,
 
     safe_point_last_check_time: Instant,
 
@@ -240,12 +241,15 @@ pub(super) struct GcManager<S: GcSafePointProvider, R: RegionInfoProvider> {
 
     /// Holds the running status. It will tell us if `GcManager` should stop working and exit.
     gc_manager_ctx: GcManagerContext,
+
+    ranges_ttl_registry: RangeTTLRegistry,
 }
 
 impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
     pub fn new(
         cfg: AutoGcConfig<S, R>,
         worker_scheduler: FutureScheduler<GcTask>,
+        ranges_ttl_registry: RangeTTLRegistry,
     ) -> GcManager<S, R> {
         GcManager {
             cfg,
@@ -253,6 +257,8 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             safe_point_last_check_time: Instant::now(),
             worker_scheduler,
             gc_manager_ctx: GcManagerContext::new(),
+            ranges_ttl_registry,
+            ttl: Default::default(),
         }
     }
 
@@ -334,7 +340,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
     fn try_update_safe_point(&mut self) -> bool {
         self.safe_point_last_check_time = Instant::now();
 
-        let safe_point = match self.cfg.safe_point_provider.get_safe_point() {
+        let (safe_point, ttl) = match self.cfg.safe_point_provider.get_safe_point() {
             Ok(res) => res,
             // Return false directly so we will check it a while later.
             Err(e) => {
@@ -355,6 +361,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             Ordering::Greater => {
                 debug!("gc_worker: update safe point"; "safe_point" => safe_point);
                 self.safe_point = safe_point;
+                self.ttl = Some(ttl);
                 AUTO_GC_SAFE_POINT_GAUGE.set(safe_point.into_inner() as i64);
                 true
             }
@@ -417,6 +424,12 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             "gc_worker: start auto gc"; "safe_point" => self.safe_point
         );
 
+        self.ttl
+            .take()
+            .and_then(|ttl| Some(self.ranges_ttl_registry.update(ttl)));
+
+        let range_expiries = self.ranges_ttl_registry.get(self.safe_point);
+
         // The following loop iterates all regions whose leader is on this TiKV and does GC on them.
         // At the same time, check whether safe_point is updated periodically. If it's updated,
         // rewinding will happen.
@@ -466,7 +479,11 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             // rewinding is needed.
             self.check_if_need_rewind(&progress, &mut need_rewind, &mut end);
 
-            progress = self.gc_next_region(progress.unwrap(), &mut processed_regions)?;
+            progress = self.gc_next_region(
+                progress.unwrap(),
+                &mut processed_regions,
+                Some(&range_expiries),
+            )?;
         }
     }
 
@@ -507,12 +524,70 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
         }
     }
 
+    fn ttl_ranges_for_first_region(expiries: &[RangeExpiry], end_key: &[u8]) -> Vec<RangeExpiry> {
+        let end_key = Key::from_encoded_slice(end_key);
+        let mut real_expiries = Vec::with_capacity(expiries.len());
+        for expiry in expiries {
+            if end_key.gt(&expiry.start_key) {
+                real_expiries.push(Clone::clone(expiry));
+            }
+        }
+        real_expiries
+    }
+
+    fn ttl_ranges_for_last_region(expiries: &[RangeExpiry], start_key: &[u8]) -> Vec<RangeExpiry> {
+        let start_key = Key::from_encoded_slice(start_key);
+        let mut real_expiries = Vec::with_capacity(expiries.len());
+        for expiry in expiries {
+            if start_key.lt(&expiry.end_key) {
+                real_expiries.push(Clone::clone(expiry));
+            }
+        }
+        real_expiries
+    }
+
+    fn ttl_ranges_for_region(
+        expiries: &[RangeExpiry],
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> Vec<RangeExpiry> {
+        let start_key = Key::from_encoded_slice(start_key);
+        let end_key = Key::from_encoded_slice(end_key);
+        let mut real_expiries = Vec::with_capacity(expiries.len());
+        for expiry in expiries {
+            if start_key.ge(&expiry.end_key) || end_key.lt(&expiry.start_key) {
+                continue;
+            }
+            real_expiries.push(Clone::clone(expiry));
+        }
+        real_expiries
+    }
+
+    fn ttl_ranges(expiries: &[RangeExpiry], region: metapb::Region) -> Option<Vec<RangeExpiry>> {
+        let start_key = region.get_start_key();
+        let end_key = region.get_end_key();
+        let real_expiries = if start_key.is_empty() {
+            Self::ttl_ranges_for_first_region(expiries, end_key)
+        } else if end_key.is_empty() {
+            Self::ttl_ranges_for_last_region(expiries, start_key)
+        } else {
+            Self::ttl_ranges_for_region(expiries, start_key, end_key)
+        };
+
+        if real_expiries.is_empty() {
+            None
+        } else {
+            Some(real_expiries)
+        }
+    }
+
     /// Does GC on the next region after `from_key`. Returns the end key of the region it processed.
     /// If we have processed to the end of all regions, returns `None`.
     fn gc_next_region(
         &mut self,
         from_key: Key,
         processed_regions: &mut usize,
+        expiries: Option<&[RangeExpiry]>,
     ) -> GcManagerResult<Option<Key>> {
         // Get the information of the next region to do GC.
         let (ctx, next_key) = self.get_next_gc_context(from_key);
@@ -520,7 +595,9 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             // No more regions.
             return Ok(None);
         }
-        let ctx = ctx.unwrap();
+
+        let (ctx, region) = ctx.unwrap();
+        let ttl_ranges = expiries.map_or(None, |e| Self::ttl_ranges(e, region));
 
         // Do GC.
         // Ignore the error and continue, since it's useless to retry this.
@@ -529,7 +606,12 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             "trying gc"; "region_id" => ctx.get_region_id(), "region_epoch" => ?ctx.region_epoch.as_ref(),
             "end_key" => next_key.as_ref().map(DisplayValue)
         );
-        if let Err(e) = sync_gc(&self.worker_scheduler, ctx.clone(), self.safe_point) {
+        if let Err(e) = sync_gc(
+            &self.worker_scheduler,
+            ctx.clone(),
+            self.safe_point,
+            ttl_ranges,
+        ) {
             warn!(
                 "failed gc"; "region_id" => ctx.get_region_id(), "region_epoch" => ?ctx.region_epoch.as_ref(),
                 "end_key" => next_key.as_ref().map(DisplayValue),
@@ -548,7 +630,10 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
     /// leader, so we can do GC on it.
     /// Returns context to call GC and end_key of the region. The returned end_key will be none if
     /// the region's end_key is empty.
-    fn get_next_gc_context(&mut self, key: Key) -> (Option<Context>, Option<Key>) {
+    fn get_next_gc_context(
+        &mut self,
+        key: Key,
+    ) -> (Option<(Context, metapb::Region)>, Option<Key>) {
         let (tx, rx) = mpsc::channel();
         let store_id = self.cfg.self_store_id;
 
@@ -583,6 +668,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
 
         match seek_region_res {
             Ok(Some(mut region)) => {
+                let region_copy = Clone::clone(&region);
                 let peer = find_peer(&region, store_id).unwrap().clone();
                 let end_key = region.take_end_key();
                 let next_key = if end_key.is_empty() {
@@ -590,7 +676,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
                 } else {
                     Some(Key::from_encoded(end_key))
                 };
-                (Some(make_context(region, peer)), next_key)
+                (Some((make_context(region, peer), region_copy)), next_key)
             }
             Ok(None) => (None, None),
             Err(e) => {

@@ -1,7 +1,10 @@
 use super::timestamp::TimeStamp;
 use byteorder::{ByteOrder, NativeEndian};
 use kvproto::kvrpcpb;
+use kvproto::pdpb;
+use std::cell::RefCell;
 use std::fmt::{self, Debug, Display, Formatter};
+use std::sync::{Arc, RwLock};
 use tikv_util::codec;
 use tikv_util::codec::bytes;
 use tikv_util::codec::bytes::BytesEncoder;
@@ -357,6 +360,101 @@ impl TxnExtra {
         &self.old_values
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct RangeTTL {
+    start_key: Key,
+    end_key: Key,
+    ttl: u64,
+}
+
+impl RangeTTL {
+    pub fn new(start_key: &[u8], end_key: &[u8], ttl: u64) -> Self {
+        RangeTTL {
+            start_key: Key::from_raw(start_key),
+            end_key: Key::from_raw(end_key),
+            ttl,
+        }
+    }
+
+    fn json_string(&self) -> String {
+        format!(
+            "{{\"start_key\": \"{}\", \"end_key\":\"{}\", \"ttl\":{}}}",
+            self.start_key, self.end_key, self.ttl
+        )
+    }
+}
+
+impl From<pdpb::RangeTtl> for RangeTTL {
+    fn from(from: pdpb::RangeTtl) -> Self {
+        Self::new(
+            from.get_start_key(),
+            from.get_end_key(),
+            from.get_ttl() * 60000,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RangeExpiry {
+    pub start_key: Key,
+    pub end_key: Key,
+    pub expiry: TimeStamp,
+}
+
+impl RangeExpiry {
+    fn new(ttl: &RangeTTL, safe_point: TimeStamp) -> Self {
+        RangeExpiry {
+            expiry: TimeStamp::compose(safe_point.physical() - ttl.ttl, 0),
+            start_key: Clone::clone(&ttl.start_key),
+            end_key: Clone::clone(&ttl.end_key),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RangeTTLRegistry {
+    ttl: Arc<RwLock<RefCell<Arc<Vec<RangeTTL>>>>>,
+}
+
+impl RangeTTLRegistry {
+    pub fn new() -> Self {
+        RangeTTLRegistry {
+            ttl: Default::default(),
+        }
+    }
+    pub fn update(&self, ranges: Vec<RangeTTL>) {
+        self.ttl.write().unwrap().replace(Arc::new(ranges));
+    }
+
+    fn get_ttl(&self) -> Arc<Vec<RangeTTL>> {
+        Clone::clone(&self.ttl.read().unwrap().borrow())
+    }
+
+    pub fn get(&self, safe_point: TimeStamp) -> Arc<Vec<RangeExpiry>> {
+        Arc::new(
+            self.get_ttl()
+                .iter()
+                .map(|ttl| RangeExpiry::new(ttl, safe_point))
+                .collect(),
+        )
+    }
+
+    pub fn json_string(&self) -> String {
+        let json = self.get_ttl().iter().fold(String::new(), |mut res, ttl| {
+            if !res.is_empty() {
+                res += ",";
+            }
+            res += &ttl.json_string();
+            res
+        });
+        format!("[{}]", json)
+    }
+}
+
+/// We know that nobody is going to mutate RefCell with shared read lock held
+unsafe impl Sync for RangeTTLRegistry {}
+unsafe impl Send for RangeTTLRegistry {}
 
 #[cfg(test)]
 mod tests {

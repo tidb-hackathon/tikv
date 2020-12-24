@@ -37,7 +37,7 @@ use futures::Future;
 use kvproto::metapb;
 use kvproto::pdpb;
 use tikv_util::time::UnixSecs;
-use txn_types::TimeStamp;
+use txn_types::{RangeTTL, TimeStamp};
 
 pub type Key = Vec<u8>;
 pub type PdFuture<T> = Box<dyn Future<Item = T, Error = Error> + Send>;
@@ -229,7 +229,7 @@ pub trait PdClient: Send + Sync {
     {
     }
 
-    fn get_gc_safe_point(&self) -> PdFuture<u64> {
+    fn get_gc_safe_point(&self) -> PdFuture<(u64, Vec<RangeTTL>)> {
         unimplemented!();
     }
 

@@ -31,7 +31,7 @@ use tikv_util::time::{duration_to_sec, Limiter, SlowTimer};
 use tikv_util::worker::{
     FutureRunnable, FutureScheduler, FutureWorker, Stopped as FutureWorkerStopped,
 };
-use txn_types::{Key, TimeStamp};
+use txn_types::{Key, RangeExpiry, RangeTTL, RangeTTLRegistry, TimeStamp};
 
 use super::applied_lock_collector::{AppliedLockCollector, Callback as LockCollectorCallback};
 use super::config::{GcConfig, GcWorkerConfigManager};
@@ -54,15 +54,15 @@ const GC_TASK_SLOW_SECONDS: u64 = 30;
 /// Provides safe point.
 /// TODO: Give it a better name?
 pub trait GcSafePointProvider: Send + 'static {
-    fn get_safe_point(&self) -> Result<TimeStamp>;
+    fn get_safe_point(&self) -> Result<(TimeStamp, Vec<RangeTTL>)>;
 }
 
 impl<T: PdClient + 'static> GcSafePointProvider for Arc<T> {
-    fn get_safe_point(&self) -> Result<TimeStamp> {
+    fn get_safe_point(&self) -> Result<(TimeStamp, Vec<RangeTTL>)> {
         let future = self.get_gc_safe_point();
         future
             .wait()
-            .map(Into::into)
+            .map(|(ts, ttl)| (ts.into(), ttl.into()))
             .map_err(|e| box_err!("failed to get safe point from PD: {:?}", e))
     }
 }
@@ -71,6 +71,7 @@ pub enum GcTask {
     Gc {
         ctx: Context,
         safe_point: TimeStamp,
+        ttl_ranges: Option<Vec<RangeExpiry>>,
         callback: Callback<()>,
     },
     UnsafeDestroyRange {
@@ -284,7 +285,8 @@ impl<E: Engine> GcRunner<E> {
 
         // range start gc with from == None, and this is an optimization to
         // skip gc before scanning all data.
-        let skip_gc = is_range_start && !reader.need_gc(safe_point, self.cfg.ratio_threshold);
+        // let skip_gc = is_range_start && !reader.need_gc(safe_point, self.cfg.ratio_threshold);
+        let skip_gc = false;
         let res = if skip_gc {
             GC_SKIPPED_COUNTER.inc();
             Ok((vec![], None))
@@ -311,7 +313,7 @@ impl<E: Engine> GcRunner<E> {
         &mut self,
         ctx: &mut Context,
         safe_point: TimeStamp,
-        keys: Vec<Key>,
+        keys: Vec<(Key, Option<TimeStamp>)>,
         mut next_scan_key: Option<Key>,
     ) -> Result<Option<Key>> {
         let snapshot = self.get_snapshot(ctx)?;
@@ -321,11 +323,15 @@ impl<E: Engine> GcRunner<E> {
             TimeStamp::zero(),
             !ctx.get_not_fill_cache(),
         );
-        for k in keys {
-            let gc_info = txn.gc(k.clone(), safe_point)?;
+        for (k, expiry) in keys {
+            let key = k.clone();
+            let gc_info = match expiry {
+                None => txn.gc(key, safe_point)?,
+                Some(e) => txn.gc_ttl(key, e, safe_point)?,
+            };
 
             if gc_info.found_versions >= GC_LOG_FOUND_VERSION_THRESHOLD {
-                debug!(
+                info!(
                     "GC found plenty versions for a key";
                     "region_id" => ctx.get_region_id(),
                     "versions" => gc_info.found_versions,
@@ -360,7 +366,26 @@ impl<E: Engine> GcRunner<E> {
         Ok(next_scan_key)
     }
 
-    fn gc(&mut self, ctx: &mut Context, safe_point: TimeStamp) -> Result<()> {
+    fn key_and_ttl(key: Key, ttl_ranges: Option<&[RangeExpiry]>) -> (Key, Option<TimeStamp>) {
+        match ttl_ranges {
+            None => (key, None),
+            Some(ranges) => {
+                for range in ranges {
+                    if range.start_key.le(&key) && range.end_key.gt(&key) {
+                        return (key, Some(range.expiry));
+                    }
+                }
+                return (key, None);
+            }
+        }
+    }
+
+    fn gc(
+        &mut self,
+        ctx: &mut Context,
+        safe_point: TimeStamp,
+        ttl_ranges: Option<Vec<RangeExpiry>>,
+    ) -> Result<()> {
         debug!(
             "start doing GC";
             "region_id" => ctx.get_region_id(),
@@ -369,7 +394,8 @@ impl<E: Engine> GcRunner<E> {
 
         if !self.need_gc(ctx, safe_point) {
             GC_SKIPPED_COUNTER.inc();
-            return Ok(());
+            info!("do not need gc, but we insist to run it");
+            //return Ok(());
         }
 
         let mut next_key = None;
@@ -384,6 +410,12 @@ impl<E: Engine> GcRunner<E> {
             if keys.is_empty() {
                 break;
             }
+
+            let ttl_ranges = ttl_ranges.as_ref().map(Vec::as_slice);
+            let keys = keys
+                .into_iter()
+                .map(|key| Self::key_and_ttl(key, ttl_ranges))
+                .collect();
 
             // Does the GC operation on all scanned keys
             next_key = self.gc_keys(ctx, safe_point, keys, next).map_err(|e| {
@@ -560,9 +592,10 @@ impl<E: Engine> FutureRunnable<GcTask> for GcRunner<E> {
             GcTask::Gc {
                 mut ctx,
                 safe_point,
+                ttl_ranges,
                 callback,
             } => {
-                let res = self.gc(&mut ctx, safe_point);
+                let res = self.gc(&mut ctx, safe_point, ttl_ranges);
                 update_metrics(res.is_err());
                 callback(res);
                 self.update_statistics_metrics();
@@ -627,12 +660,14 @@ fn schedule_gc(
     scheduler: &FutureScheduler<GcTask>,
     ctx: Context,
     safe_point: TimeStamp,
+    ttl_ranges: Option<Vec<RangeExpiry>>,
     callback: Callback<()>,
 ) -> Result<()> {
     scheduler
         .schedule(GcTask::Gc {
             ctx,
             safe_point,
+            ttl_ranges,
             callback,
         })
         .or_else(handle_gc_task_schedule_error)
@@ -643,11 +678,13 @@ pub fn sync_gc(
     scheduler: &FutureScheduler<GcTask>,
     ctx: Context,
     safe_point: TimeStamp,
+    ttl_ranges: Option<Vec<RangeExpiry>>,
 ) -> Result<()> {
-    wait_op!(|callback| schedule_gc(scheduler, ctx, safe_point, callback)).unwrap_or_else(|| {
-        error!("failed to receive result of gc");
-        Err(box_err!("gc_worker: failed to receive result of gc"))
-    })
+    wait_op!(|callback| schedule_gc(scheduler, ctx, safe_point, ttl_ranges, callback))
+        .unwrap_or_else(|| {
+            error!("failed to receive result of gc");
+            Err(box_err!("gc_worker: failed to receive result of gc"))
+        })
 }
 
 /// Used to schedule GC operations.
@@ -743,10 +780,12 @@ impl<E: Engine> GcWorker<E> {
     pub fn start_auto_gc<S: GcSafePointProvider, R: RegionInfoProvider>(
         &self,
         cfg: AutoGcConfig<S, R>,
+        expiry_registry: RangeTTLRegistry,
     ) -> Result<()> {
         let mut handle = self.gc_manager_handle.lock().unwrap();
         assert!(handle.is_none());
-        let new_handle = GcManager::new(cfg, self.worker_scheduler.clone()).start()?;
+        let new_handle =
+            GcManager::new(cfg, self.worker_scheduler.clone(), expiry_registry).start()?;
         *handle = Some(new_handle);
         Ok(())
     }
@@ -821,6 +860,7 @@ impl<E: Engine> GcWorker<E> {
                 .schedule(GcTask::Gc {
                     ctx,
                     safe_point,
+                    ttl_ranges: None,
                     callback,
                 })
                 .or_else(handle_gc_task_schedule_error)

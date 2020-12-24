@@ -20,7 +20,7 @@ pub use lock::{Lock, LockType};
 pub use timestamp::{TimeStamp, TsSet};
 pub use types::{
     is_short_value, Key, KvPair, Mutation, MutationType, OldValue, TxnExtra, Value,
-    SHORT_VALUE_MAX_LEN,
+    RangeTTL, RangeExpiry, RangeTTLRegistry, SHORT_VALUE_MAX_LEN,
 };
 pub use write::{Write, WriteRef, WriteType};
 
