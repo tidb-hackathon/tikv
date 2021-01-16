@@ -594,7 +594,7 @@ impl PdClient for RpcClient {
         self.leader_client.on_reconnect(Box::new(f))
     }
 
-    fn get_gc_safe_point(&self) -> PdFuture<(u64, Vec<RangeTTL>)> {
+    fn get_gc_safe_point(&self) -> PdFuture<(u64, u64, Vec<RangeTTL>)> {
         let timer = Instant::now();
 
         let mut req = pdpb::GetGcSafePointRequest::default();
@@ -616,6 +616,7 @@ impl PdClient for RpcClient {
                 check_resp_header(resp.get_header())?;
                 Ok((
                     resp.get_safe_point(),
+                    resp.get_now(),
                     resp.take_range_ttl()
                         .into_vec()
                         .into_iter()

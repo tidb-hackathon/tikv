@@ -54,15 +54,15 @@ const GC_TASK_SLOW_SECONDS: u64 = 30;
 /// Provides safe point.
 /// TODO: Give it a better name?
 pub trait GcSafePointProvider: Send + 'static {
-    fn get_safe_point(&self) -> Result<(TimeStamp, Vec<RangeTTL>)>;
+    fn get_safe_point(&self) -> Result<(TimeStamp, TimeStamp, Vec<RangeTTL>)>;
 }
 
 impl<T: PdClient + 'static> GcSafePointProvider for Arc<T> {
-    fn get_safe_point(&self) -> Result<(TimeStamp, Vec<RangeTTL>)> {
+    fn get_safe_point(&self) -> Result<(TimeStamp, TimeStamp, Vec<RangeTTL>)> {
         let future = self.get_gc_safe_point();
         future
             .wait()
-            .map(|(ts, ttl)| (ts.into(), ttl.into()))
+            .map(|(ts, now, ttl)| (ts.into(), now.into(), ttl.into()))
             .map_err(|e| box_err!("failed to get safe point from PD: {:?}", e))
     }
 }
@@ -272,6 +272,7 @@ impl<E: Engine> GcRunner<E> {
         ctx: &mut Context,
         safe_point: TimeStamp,
         from: Option<Key>,
+        ttl_ranges: Option<&[RangeExpiry]>,
     ) -> Result<(Vec<Key>, Option<Key>)> {
         let snapshot = self.get_snapshot(ctx)?;
         let mut reader = MvccReader::new(
@@ -285,8 +286,11 @@ impl<E: Engine> GcRunner<E> {
 
         // range start gc with from == None, and this is an optimization to
         // skip gc before scanning all data.
-        // let skip_gc = is_range_start && !reader.need_gc(safe_point, self.cfg.ratio_threshold);
-        let skip_gc = false;
+        let skip_gc = if ttl_ranges.is_none() {
+            is_range_start && !reader.need_gc(safe_point, self.cfg.ratio_threshold)
+        } else {
+            false
+        };
         let res = if skip_gc {
             GC_SKIPPED_COUNTER.inc();
             Ok((vec![], None))
@@ -392,17 +396,17 @@ impl<E: Engine> GcRunner<E> {
             "safe_point" => safe_point
         );
 
-        if !self.need_gc(ctx, safe_point) {
+        if ttl_ranges.is_none() && !self.need_gc(ctx, safe_point) {
             GC_SKIPPED_COUNTER.inc();
-            info!("do not need gc, but we insist to run it");
-            //return Ok(());
+            return Ok(());
         }
 
         let mut next_key = None;
         loop {
             // Scans at most `GCConfig.batch_keys` keys
+            let ttl_ranges = ttl_ranges.as_ref().map(Vec::as_slice);
             let (keys, next) = self
-                .scan_keys(ctx, safe_point, next_key)
+                .scan_keys(ctx, safe_point, next_key, ttl_ranges)
                 .map_err(|e| {
                     warn!("gc scan_keys failed"; "region_id" => ctx.get_region_id(), "safe_point" => safe_point, "err" => ?e);
                     e
@@ -411,7 +415,6 @@ impl<E: Engine> GcRunner<E> {
                 break;
             }
 
-            let ttl_ranges = ttl_ranges.as_ref().map(Vec::as_slice);
             let keys = keys
                 .into_iter()
                 .map(|key| Self::key_and_ttl(key, ttl_ranges))

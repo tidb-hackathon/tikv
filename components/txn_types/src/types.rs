@@ -403,9 +403,21 @@ pub struct RangeExpiry {
 }
 
 impl RangeExpiry {
-    fn new(ttl: &RangeTTL, safe_point: TimeStamp) -> Self {
+    fn new(ttl: &RangeTTL, safe_point: TimeStamp, now: TimeStamp) -> Self {
+        let safe_point = safe_point.physical();
+        let now = now.physical();
+        let expiry = if now == 0 {
+            safe_point - ttl.ttl
+        } else {
+            now - ttl.ttl
+        };
+        let expiry = if expiry > safe_point {
+            safe_point
+        } else {
+            expiry
+        };
         RangeExpiry {
-            expiry: TimeStamp::compose(safe_point.physical() - ttl.ttl, 0),
+            expiry: TimeStamp::compose(expiry, 0),
             start_key: Clone::clone(&ttl.start_key),
             end_key: Clone::clone(&ttl.end_key),
         }
@@ -431,11 +443,11 @@ impl RangeTTLRegistry {
         Clone::clone(&self.ttl.read().unwrap().borrow())
     }
 
-    pub fn get(&self, safe_point: TimeStamp) -> Arc<Vec<RangeExpiry>> {
+    pub fn get(&self, safe_point: TimeStamp, now: TimeStamp) -> Arc<Vec<RangeExpiry>> {
         Arc::new(
             self.get_ttl()
                 .iter()
-                .map(|ttl| RangeExpiry::new(ttl, safe_point))
+                .map(|ttl| RangeExpiry::new(ttl, safe_point, now))
                 .collect(),
         )
     }

@@ -232,6 +232,7 @@ pub(super) struct GcManager<S: GcSafePointProvider, R: RegionInfoProvider> {
     /// The current safe point. `GcManager` will try to update it periodically. When `safe_point` is
     /// updated, `GCManager` will start to do GC on all regions.
     safe_point: TimeStamp,
+    now: TimeStamp,
     ttl: Option<Vec<RangeTTL>>,
 
     safe_point_last_check_time: Instant,
@@ -254,6 +255,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
         GcManager {
             cfg,
             safe_point: TimeStamp::zero(),
+            now: TimeStamp::zero(),
             safe_point_last_check_time: Instant::now(),
             worker_scheduler,
             gc_manager_ctx: GcManagerContext::new(),
@@ -340,7 +342,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
     fn try_update_safe_point(&mut self) -> bool {
         self.safe_point_last_check_time = Instant::now();
 
-        let (safe_point, ttl) = match self.cfg.safe_point_provider.get_safe_point() {
+        let (safe_point, now, ttl) = match self.cfg.safe_point_provider.get_safe_point() {
             Ok(res) => res,
             // Return false directly so we will check it a while later.
             Err(e) => {
@@ -361,6 +363,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             Ordering::Greater => {
                 debug!("gc_worker: update safe point"; "safe_point" => safe_point);
                 self.safe_point = safe_point;
+                self.now = now;
                 self.ttl = Some(ttl);
                 AUTO_GC_SAFE_POINT_GAUGE.set(safe_point.into_inner() as i64);
                 true
@@ -428,7 +431,7 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider> GcManager<S, R> {
             .take()
             .and_then(|ttl| Some(self.ranges_ttl_registry.update(ttl)));
 
-        let range_expiries = self.ranges_ttl_registry.get(self.safe_point);
+        let range_expiries = self.ranges_ttl_registry.get(self.safe_point, self.now);
 
         // The following loop iterates all regions whose leader is on this TiKV and does GC on them.
         // At the same time, check whether safe_point is updated periodically. If it's updated,
